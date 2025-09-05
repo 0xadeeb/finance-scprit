@@ -1,0 +1,67 @@
+# Google Drive API Credentials - NEVER COMMIT THESE!
+credentials.json
+service-account.json
+token.json
+
+#git
+.github/
+
+# Configuration files with sensitive IDs
+config.json
+
+# Temporary files and directories
+temp/
+*.tmp
+*.temp
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Excel temporary files
+~$*.xlsx
+~$*.xls
+
+# Logs
+*.log

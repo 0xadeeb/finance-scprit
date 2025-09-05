@@ -1,0 +1,8 @@
+{
+  "storage_type": "cloud",
+  "cloud_provider": "google_drive",
+  "local_base_path": "./data",
+  "bank_folder_id": "REPLACE_WITH_YOUR_BANK_FOLDER_ID_OR_LOCAL_PATH",
+  "finance_file_id": "REPLACE_WITH_YOUR_FINANCE_XLSX_FILE_ID_OR_LOCAL_PATH",
+  "merchant_category_file_id": ""
+}
