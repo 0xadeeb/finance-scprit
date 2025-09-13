@@ -9,9 +9,11 @@ __author__ = "Finance Analyzer Team"
 from .main import FinanceAnalyzer
 from .cloud_storage import CloudStorageFactory
 from .file_access import FileAccessorFactory
+from . import models
 
 __all__ = [
     "FinanceAnalyzer",
     "CloudStorageFactory",
-    "FileAccessorFactory"
+    "FileAccessorFactory",
+    "models"
 ]

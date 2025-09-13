@@ -2,9 +2,9 @@
 Abstract base class for bank-specific transaction parsing.
 """
 
-import pandas as pd
 from abc import ABC, abstractmethod
 from typing import Tuple, Dict
+from ..models import Transaction
 
 
 class Bank(ABC):
@@ -19,9 +19,9 @@ class Bank(ABC):
         self.debit_col = debit_col
     
     @abstractmethod
-    def parse_transaction(self, transaction_details: pd.Series) -> Tuple[str, str]:
-        """Parse transaction to extract category and merchant information"""
-        pass
+    def parse_transaction(self, transaction: Transaction) -> Tuple[str, str]:  # pragma: no cover - interface
+        """Parse transaction to extract (category, merchant)."""
+        raise NotImplementedError
     
     def get_column_mapping(self) -> Dict[str, str]:
         """Get the column name mapping for standardization"""

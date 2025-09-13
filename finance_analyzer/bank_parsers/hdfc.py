@@ -2,10 +2,10 @@
 HDFC Bank specific transaction processing.
 """
 
-import pandas as pd
 import re
 from typing import Tuple
 from .base import Bank
+from ..models import Transaction
 
 
 class HDFCBank(Bank):
@@ -16,11 +16,9 @@ class HDFCBank(Bank):
         # Regex pattern for UPI transactions: UPI-<merchant_name>-<merchant_id>-<12_digit_txn_id>-<category>
         self.upi_pattern = re.compile(r"^UPI-(.*?)-(.*?)-\d{12}-(.+)$")
     
-    def parse_transaction(self, transaction_details: pd.Series) -> Tuple[str, str]:
+    def parse_transaction(self, transaction: Transaction) -> Tuple[str, str]:
         """Parse HDFC transaction details using regex for UPI transactions"""
-        description = transaction_details['Description']
-        original_desc = description
-        description = description.upper().strip()
+        description = transaction.description.upper().strip()
         
         category = None
         merchant = None
@@ -33,5 +31,4 @@ class HDFCBank(Bank):
                 merchant_id = match.group(2).strip()
                 merchant = f"{merchant_name}|{merchant_id}"
                 category = match.group(3).strip().lower()
-        
         return category, merchant

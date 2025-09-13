@@ -10,17 +10,28 @@ import pandas as pd
 from typing import Dict, List
 import glob
 import shutil
+import asyncio
 
 from .cloud_storage import CloudStorageFactory
-from .bank_parsers import BankParserRegistry
 from .writers import WriterFactory
 from .config_manager import ConfigManager
 from .transaction_processor import TransactionProcessor
+from .services.merchant_mapping_store import MerchantMappingStore
+from .statement_readers import StatementReaderFactory
+from .models import Transaction
 from .file_access import FileAccessorFactory
 from .constants import (
-    TEMP_DIR, LOCAL_OUTPUT_FILE, CATEGORIES, CAT_MAPPING, 
-    BANK_ACCOUNTS, CREDIT_CATEGORIES, DEBIT_CATEGORIES, 
-    NET_CATEGORIES, BALANCE_ROWS
+    TEMP_DIR, LOCAL_OUTPUT_FILE, CATEGORIES, CAT_MAPPING,
+    BANK_ACCOUNTS
+)
+from .services.summary_service import SummaryService
+from .interaction.cli_async_port import CliAsyncInteractionPort
+from .interaction.port import (
+    CategorizationItem, CategorizationDecision, CashEntry, SummaryView,
+    SummaryCategoryLine
+)
+from .categorization_strategy import (
+    CategorizationMode, CategorizationStrategy, UserPromptStrategy, AutoStrategy
 )
 
 
@@ -34,6 +45,10 @@ class FinanceAnalyzer:
         self.writer = None
         self.temp_files_created: List[str] = []
         self.cleanup_registered = False
+        self.summary_service = SummaryService()
+        self.statement_reader = None
+        # Interaction port (set in setup to allow swapping implementations later)
+        self.interaction_port = None
         
     def _register_signal_handlers(self) -> None:
         """Register signal handlers for graceful cleanup"""
@@ -69,8 +84,15 @@ class FinanceAnalyzer:
         # Initialize components
         self.config = ConfigManager()
         self.file_accessor = FileAccessorFactory.create_from_config(self.config)
-        self.transaction_processor = TransactionProcessor(self.file_accessor, self._track_temp_file)
+        merchant_store = MerchantMappingStore(self.file_accessor, self._track_temp_file)
+        self.transaction_processor = TransactionProcessor(
+            self.file_accessor, self._track_temp_file, merchant_store=merchant_store
+        )
+        # Statement reader (format decided by config)
+        self.statement_reader = StatementReaderFactory.create(self.config, self.file_accessor, self._track_temp_file)
         self.writer = WriterFactory.create('excel')
+        # Interaction port (CLI implementation; future GUI can swap here)
+        self.interaction_port = CliAsyncInteractionPort()
         
         print(f"✅ Setup complete using {self.file_accessor.get_provider_name()}")
         print("💡 Press Ctrl+C at any time to safely exit and cleanup temporary files")
@@ -81,30 +103,9 @@ class FinanceAnalyzer:
             os.makedirs(TEMP_DIR)
             print(f"✅ Created temp directory: {TEMP_DIR}")
     
-    def _get_user_input(self) -> tuple:
-        """Get month and year from user with proper interrupt handling"""
-        try:
-            month = int(input("\n📅 Enter the month (1-12): "))
-            if month < 1 or month > 12:
-                raise ValueError("Month must be between 1 and 12")
-                
-            year = input("📅 Enter the year (default 2024): ").strip() or "2024"
-            
-            # Basic validation for year
-            year_int = int(year)
-            if year_int < 2000 or year_int > 2030:
-                print("⚠️  Warning: Year seems unusual, but continuing...")
-                
-            return month, year
-            
-        except KeyboardInterrupt:
-            print(f"\n\n🛑 Input cancelled by user")
-            self._comprehensive_cleanup()
-            print("✅ Cleanup complete. Goodbye!")
-            sys.exit(0)
-        except ValueError as e:
-            print(f"❌ Invalid input: {e}")
-            return self._get_user_input()  # Retry
+    # Legacy direct input removed; month/year now obtained via interaction port (async)
+    async def _get_initial_context(self):
+        return await self.interaction_port.request_initial_context()
     
     def _download_finance_file(self) -> None:
         """Download the Finance.xlsx file from storage"""
@@ -116,120 +117,100 @@ class FinanceAnalyzer:
         if not self.file_accessor.download_to_temp(self.config.finance_file_id, LOCAL_OUTPUT_FILE):
             raise Exception("Failed to download Finance.xlsx file")
     
-    def _process_bank_transactions(self, year: str, month: int) -> Dict[str, int]:
-        """Process transactions for all banks"""
+    # Helper removed (direct awaiting of returned futures now used)
+
+    def _apply_categorization_decisions(self, pending, decisions: List[CategorizationDecision]):
+        for d in decisions:
+            if d.idx < 0 or d.idx >= len(pending):
+                continue
+            tx = pending[d.idx].transaction
+            tx.category = d.category
+            if d.remember_mapping and tx.merchant and tx.merchant not in self.transaction_processor.merchant_category_dict:
+                self.transaction_processor.merchant_category_dict[tx.merchant] = d.category
+                self.transaction_processor.merchant_store.mark_dirty()
+
+    def _integrate_cash_entries(self, cash_entries: List[CashEntry], category_sums, transactions_dfs):
+        if not cash_entries:
+            return
+        rows = []
+        for entry in cash_entries:
+            # Treat cash outflow as Debit
+            amount = entry.amount
+            category_sums.setdefault(entry.category, 0)
+            category_sums[entry.category] += amount
+            rows.append({
+                'Date': entry.date,
+                'Description': entry.description,
+                'Credit': '',
+                'Debit': amount,
+                'Category': entry.category
+            })
+        import pandas as pd
+        df = pd.DataFrame(rows, columns=['Date', 'Description', 'Credit', 'Debit', 'Category'])
+        transactions_dfs['CASH'] = df
+
+    def _select_strategy(self, mode: CategorizationMode) -> CategorizationStrategy:
+        if mode == CategorizationMode.PROMPT_USER:
+            return UserPromptStrategy(self.interaction_port, CATEGORIES)
+        # AUTO and AI currently both no-op (pure processing already done)
+        return AutoStrategy()
+
+    async def _process_bank_transactions(self, year: str, month: int, mode: CategorizationMode):
+        """Process transactions and delegate pending resolution to chosen strategy."""
         print(f"\n💳 Processing bank statements...")
-        
         category_sums = {category: 0 for category in CATEGORIES}
         transactions_dfs = {}
-        
-        # Setup category mappings
+
+        # Ensure CAT_MAPPING lower-case canonicalization present
         for item in CATEGORIES:
             CAT_MAPPING[item.lower()] = item.title()
-        
+
+        strategy_impl = self._select_strategy(mode)
+
         for bank_name in BANK_ACCOUNTS:
             try:
                 print(f"\nProcessing {bank_name}...")
-                
-                # Read transactions from cloud storage
-                transactions_df = self.transaction_processor.read_transactions_df(
-                    bank_name, year, month, self.config.bank_folder_id
+                # 1. Read raw transactions (domain objects)
+                transactions = self.statement_reader.read(bank_name, year, month)
+
+                # 2. Pure processing (no prompts)
+                transactions, mapping, pending = self.transaction_processor.categorize_transactions(
+                    bank_name, transactions
                 )
+                # mapping may be same object; assign for clarity
+                self.transaction_processor.merchant_category_dict = mapping
 
-                # Process each transaction
-                for i, row in transactions_df.iterrows():
-                    amount = row['Debit'] if pd.notna(row['Debit']) else row['Credit']
-                    if pd.notna(row['Debit']):
-                        amount = -amount
+                # 3. Resolve pending categorization via strategy if any
+                if pending:
+                    decisions = await strategy_impl.categorize(pending)  # type: ignore[arg-type]
+                    self._apply_categorization_decisions(pending, decisions)
 
-                    if pd.isna(amount):
-                        transactions_df = transactions_df.iloc[:i]
-                        break
-
-                    # Create a copy of the row with the amount for categorization
-                    transaction_row = row.copy()
-                    transaction_row['Amount'] = amount
-
-                    category = self.transaction_processor.categorise_transaction(bank_name, transaction_row)
-                    transactions_df.loc[i, 'Category'] = category
-                    category_sums[category] += amount
-
-                transactions_dfs[bank_name] = transactions_df
-                print(f"✅ Processed {len(transactions_df)} transactions from {bank_name}")
-                
+                # 4. Accumulate category sums & build DataFrame for writer
+                rows = []
+                for tx in transactions:
+                    if tx.category and tx.amount is not None:
+                        category_sums[tx.category] += tx.amount
+                    rows.append({
+                        'Date': tx.date,
+                        'Description': tx.description,
+                        'Credit': tx.credit if tx.credit is not None else '',
+                        'Debit': tx.debit if tx.debit is not None else '',
+                        'Category': tx.category or ''
+                    })
+                df = pd.DataFrame(rows, columns=['Date', 'Description', 'Credit', 'Debit', 'Category'])
+                transactions_dfs[bank_name] = df
+                print(f"✅ Processed {len(transactions)} transactions from {bank_name} (Pending resolved: {len(pending)})")
             except FileNotFoundError as e:
-                print(f"⚠️  Skipping {bank_name}: {str(e)}")
+                print(f"⚠️  Skipping {bank_name}: {e}")
                 continue
             except Exception as e:
-                print(f"❌ Error processing {bank_name}: {str(e)}")
+                print(f"❌ Error processing {bank_name}: {e}")
                 continue
-        
         return category_sums, transactions_dfs
     
     def _update_summary(self, year: str, month: int, category_sums: Dict[str, int]) -> pd.DataFrame:
-        """Update the summary DataFrame with new data"""
-        print(f"\n📈 Generating summary...")
-        
-        # Load existing summary
-        with pd.ExcelFile(LOCAL_OUTPUT_FILE, engine='openpyxl') as xls:
-            summary_df = pd.read_excel(xls, year, index_col=0)
-
-        # Update summary with new data
-        for category, total in category_sums.items():
-            summary_df.loc[category, calendar.month_name[month]] = total
-
-        monthly_columns = [calendar.month_name[i + 1] for i in range(12)]
-
-        # Calculate totals
-        summary_df.loc['Total Credit', calendar.month_name[month]] = sum([
-            summary_df.loc[category, calendar.month_name[month]] for category in CREDIT_CATEGORIES
-        ])
-        summary_df.loc['Total Debit', calendar.month_name[month]] = sum([
-            summary_df.loc[category, calendar.month_name[month]] for category in DEBIT_CATEGORIES
-        ])
-        summary_df.loc['Total NET', calendar.month_name[month]] = sum([
-            summary_df.loc[category, calendar.month_name[month]] for category in NET_CATEGORIES
-        ])
-        
-        # Calculate averages and totals
-        summary_df['Avg'] = summary_df[monthly_columns].mean(axis=1).round(2)
-        summary_df['Total'] = summary_df[monthly_columns].sum(axis=1).round(2) - summary_df['Avg']
-        
-        # Update balances
-        summary_df.loc['Closing Bank Bal.', calendar.month_name[month]] = (
-            summary_df.loc['Opening Bank Bal.', calendar.month_name[month]] + 
-            summary_df.loc['Total Credit', calendar.month_name[month]] + 
-            summary_df.loc['Total Debit', calendar.month_name[month]]
-        )
-        summary_df.loc['Closing In Hand', calendar.month_name[month]] = (
-            summary_df.loc['Opening In Hand', calendar.month_name[month]]
-        )
-
-        # Update next month's opening balances
-        if month != 12:
-            summary_df.loc['Opening Bank Bal.', calendar.month_name[month + 1]] = (
-                summary_df.loc['Closing Bank Bal.', calendar.month_name[month]]
-            )
-            summary_df.loc['Opening In Hand', calendar.month_name[month + 1]] = (
-                summary_df.loc['Closing In Hand', calendar.month_name[month]]
-            )
-
-        # Reorder rows
-        ordered_rows = (
-            BALANCE_ROWS[:2] + CREDIT_CATEGORIES + ["Total Credit"] + 
-            DEBIT_CATEGORIES + ["Total Debit"] + NET_CATEGORIES + 
-            ["Total NET"] + BALANCE_ROWS[2:]
-        )
-
-        if len(summary_df) != len(ordered_rows):
-            print("❌ Summary DataFrame structure mismatch")
-            print(f"Expected rows: {len(ordered_rows)}")
-            print(f"Actual rows: {len(summary_df)}")
-            print(f"Actual index: {summary_df.index.values}")
-            raise Exception("Summary DataFrame structure mismatch")
-
-        summary_df = summary_df.reindex(ordered_rows)
-        return summary_df
+        """Thin wrapper delegating to SummaryService (backward compatibility)."""
+        return self.summary_service.update_summary(year, month, category_sums)
     
     def _upload_results(self) -> None:
         """Upload results back to storage"""
@@ -312,45 +293,46 @@ class FinanceAnalyzer:
         # Clear the tracking list
         self.temp_files_created.clear()
     
-    def run(self) -> None:
-        """Run the main application"""
+    async def run_async(self) -> None:
+        """Async execution path (single event loop)."""
         try:
-            # Setup
             self.setup()
-            
-            # Get user input
-            month, year = self._get_user_input()
-            print(f"\n📊 Processing data for {calendar.month_name[month]} {year}")
-            
-            # Download finance file
+            ctx = await self._get_initial_context()
+            month = ctx.month
+            year = str(ctx.year)
+            mode = ctx.mode
+            print(f"\n📊 Processing data for {calendar.month_name[month]} {year} (mode={mode.value})")
+
             self._download_finance_file()
-            
-            # Load merchant category mappings
             self.transaction_processor.manage_merchant_category_file(self.config.bank_folder_id)
-            
-            # Process transactions
-            category_sums, transactions_dfs = self._process_bank_transactions(year, month)
-            
-            # Save merchant category mappings
-            self.transaction_processor.save_merchant_category_file(self.config.bank_folder_id)
-            
-            # Update summary
+            category_sums, transactions_dfs = await self._process_bank_transactions(year, month, mode)
+
+            cash_entries = await self.interaction_port.request_cash_entries(month, int(year), CATEGORIES)
+            self._integrate_cash_entries(cash_entries, category_sums, transactions_dfs)
+
+            if self.transaction_processor.merchant_store.dirty:
+                self.transaction_processor.save_merchant_category_file(self.config.bank_folder_id)
+
             summary_df = self._update_summary(year, month, category_sums)
-            
-            # Write to Excel
+
+            lines = [SummaryCategoryLine(category=k, total=v) for k, v in category_sums.items()]
+            total_income = sum(v for k, v in category_sums.items() if v > 0)
+            total_expense = sum(-v for k, v in category_sums.items() if v < 0)
+            net = total_income - total_expense
+            summary_view = SummaryView(month=month, year=int(year), categories=lines, total_income=total_income, total_expense=total_expense, net=net)
+            await self.interaction_port.show_summary(summary_view)
+
             print(f"💾 Saving results to Excel...")
             self.writer.write(year, month, transactions_dfs, summary_df, LOCAL_OUTPUT_FILE)
-            
-            # Upload results
-            self._upload_results()
-            
-            # Success message
+            # self._upload_results()
             print(f"\n✅ Processing complete! Summary for {calendar.month_name[month]} {year} has been updated.")
             print(f"📊 Processed {sum(len(df) for df in transactions_dfs.values())} total transactions")
-            
         except Exception as e:
             print(f"\n❌ Error: {str(e)}")
             raise
         finally:
-            # Cleanup
             self._cleanup()
+
+    def run(self) -> None:
+        """Public synchronous entrypoint that wraps async flow."""
+        asyncio.run(self.run_async())

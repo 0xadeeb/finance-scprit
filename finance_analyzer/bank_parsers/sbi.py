@@ -2,10 +2,10 @@
 SBI Bank specific transaction processing.
 """
 
-import pandas as pd
 import re
 from typing import Tuple
 from .base import Bank
+from ..models import Transaction
 
 
 class SBIBank(Bank):
@@ -16,9 +16,9 @@ class SBIBank(Bank):
         # Regex pattern for UPI transactions
         self.upi_pattern = re.compile(r"^.*?UPI\/(?:CR|DR)\/\d{12}\/([^/]+)\/([^/]+)\/([^/]+)\/(.+?)--$")
     
-    def parse_transaction(self, transaction_details: pd.Series) -> Tuple[str, str]:
+    def parse_transaction(self, transaction: Transaction) -> Tuple[str, str]:
         """Parse SBI transaction details"""
-        description = transaction_details['Description'].upper()
+        description = transaction.description.upper()
         category = None
         merchant = None
         
