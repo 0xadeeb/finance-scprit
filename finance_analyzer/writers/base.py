@@ -1,32 +1,62 @@
-"""
-Abstract base class for different output writers.
-"""
+"""Writer abstraction decoupled from pandas.
 
-import pandas as pd
+Writers now accept:
+  * transactions_by_bank: Dict[str, List[Transaction]]
+  * summary: SummaryData domain object
+
+Infrastructure writers (like Excel) may internally convert these to pandas
+DataFrames for convenience/formatting, but the public interface exposed to
+the core domain stays free of DataFrame coupling.
+"""
+from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from typing import Dict
+from typing import Dict, List
+
+from ..models import Transaction
+from ..services.summary.models import SummaryData
 
 
 class Writer(ABC):
     """Abstract base class for output writers"""
-    
+
     @abstractmethod
-    def write(self, year: str, month: int, transactions_dfs: Dict[str, pd.DataFrame], 
-             summary_df: pd.DataFrame, output_path: str) -> bool:
-        """Write the financial data to output format"""
-        pass
-    
+    def write(
+        self,
+        year: str,
+        month: int,
+        transactions_by_bank: Dict[str, List[Transaction]],
+        summary: SummaryData,
+        output_path: str,
+    ) -> bool:
+        """Persist financial data.
+
+        Parameters
+        ----------
+        year : str
+            Year of processing (sheet name for Excel).
+        month : int
+            Month number 1-12.
+        transactions_by_bank : Dict[str, List[Transaction]]
+            Domain transactions grouped by bank name.
+        summary : SummaryData
+            Domain summary object.
+        output_path : str
+            Target file path.
+        """
+        raise NotImplementedError
+
     @abstractmethod
     def get_file_extension(self) -> str:
         """Get the file extension for this writer"""
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     def get_writer_name(self) -> str:
         """Get the name of this writer"""
-        pass
-    
+        raise NotImplementedError
+
     @abstractmethod
     def supports_formatting(self) -> bool:
         """Check if this writer supports advanced formatting"""
-        pass
+        raise NotImplementedError

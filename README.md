@@ -111,10 +111,9 @@ python tests/test_hdfc_parsing.py
 - Excel files (.xlsx, .xls)
 - CSV files (with proper bank statement format)
 
-### Output  
-- Excel files with professional formatting
-- CSV files for data analysis
-- JSON files for integration
+### Output
+- Excel file with professional formatting (current)
+- (Planned) Optional CSV / JSON exporters will return later once stabilized
 
 ## Troubleshooting
 
@@ -152,14 +151,59 @@ For detailed setup instructions and troubleshooting:
 ### Project Structure
 ```
 finance-scprit/
-├── main.py                     # Entry point
-├── finance_analyzer/           # Main package
-│   ├── bank_parsers/          # Bank-specific parsing
-│   ├── cloud_storage/         # Cloud storage providers  
-│   └── file_access/           # File system abstraction
-├── tests/                     # Test suite
-├── config.json               # Configuration
-└── requirements.txt          # Dependencies
+├── main.py                              # Entry script delegating to package
+├── finance_analyzer/                    # Core application package
+│   ├── main.py                          # FinanceAnalyzer orchestrator (async)
+│   ├── constants.py                     # Shared constants & category lists
+│   ├── models.py                        # Domain models (Transaction, etc.)
+│   ├── transaction_processor.py         # Pure categorization & merchant mapping application
+│   ├── config_manager.py                # Loads and validates config
+│   ├── bank_parsers/                    # Bank-specific statement normalizers
+│   │   ├── base.py
+│   │   ├── hdfc.py
+│   │   ├── sbi.py
+│   │   └── registry.py                  # Bank parser registry
+│   ├── statement_readers/               # Reads raw bank statement files
+│   │   ├── base.py
+│   │   ├── excel_reader.py
+│   │   └── factory.py
+│   ├── categorization_strategy/         # Strategy pattern for pending categorizations
+│   │   ├── base.py
+│   │   ├── user_prompt.py
+│   │   └── auto.py
+│   ├── interaction/                     # User interaction (CLI async port)
+│   │   ├── port.py                      # Interaction port & DTOs
+│   │   └── cli_async_port.py            # Concrete CLI implementation
+│   ├── file_access/                     # Storage abstraction (local / future cloud)
+│   │   ├── base.py
+│   │   ├── local_accessor.py
+│   │   ├── cloud_accessor.py
+│   │   └── factory.py
+│   ├── cloud_storage/                   # Cloud provider adapters
+│   │   ├── base.py
+│   │   ├── google_drive_api.py
+│   │   ├── dropbox_api.py
+│   │   ├── onedrive_api.py
+│   │   └── factory.py
+│   ├── services/
+│   │   ├── merchant_mapping_store.py    # Dirty-tracked merchant mapping persistence
+│   │   └── summary/                     # Summary domain + service (pandas isolated here)
+│   │       ├── models.py                # SummaryData & SummaryRow domain
+│   │       └── service.py               # SummaryService building SummaryData
+│   ├── writers/                         # Output writers (domain-facing)
+│   │   ├── base.py
+│   │   ├── excel_writer.py              # Converts domain -> Excel (pandas internally)
+│   │   └── factory.py
+├── data/                                # (Example) Local data directory (not always committed)
+├── config.json                          # Active configuration
+├── config.json.template                 # Template configuration
+├── config.local.example.json            # Example local configuration
+├── requirements.txt                     # Python dependencies
+├── README.md
+├── SETUP_INSTRUCTIONS.md                # Cloud setup instructions
+├── setup.sh                             # Optional setup script
+├── credentials.json / token.json        # OAuth artifacts (should be gitignored in real setup)
+└── LICENSE
 ```
 
 ### Adding New Banks

@@ -6,7 +6,6 @@ import os
 import signal
 import sys
 import calendar
-import pandas as pd
 from typing import Dict, List
 import glob
 import shutil
@@ -24,12 +23,13 @@ from .constants import (
     TEMP_DIR, LOCAL_OUTPUT_FILE, CATEGORIES, CAT_MAPPING,
     BANK_ACCOUNTS
 )
-from .services.summary_service import SummaryService
+from .services.summary.service import SummaryService
 from .interaction.cli_async_port import CliAsyncInteractionPort
 from .interaction.port import (
     CategorizationItem, CategorizationDecision, CashEntry, SummaryView,
     SummaryCategoryLine
 )
+from .interaction.presenters import build_summary_view
 from .categorization_strategy import (
     CategorizationMode, CategorizationStrategy, UserPromptStrategy, AutoStrategy
 )
@@ -129,25 +129,28 @@ class FinanceAnalyzer:
                 self.transaction_processor.merchant_category_dict[tx.merchant] = d.category
                 self.transaction_processor.merchant_store.mark_dirty()
 
-    def _integrate_cash_entries(self, cash_entries: List[CashEntry], category_sums, transactions_dfs):
+    def _integrate_cash_entries(self, cash_entries: List[CashEntry], category_sums, transactions_by_bank):
         if not cash_entries:
             return
-        rows = []
+        txs: List[Transaction] = []
         for entry in cash_entries:
-            # Treat cash outflow as Debit
             amount = entry.amount
             category_sums.setdefault(entry.category, 0)
             category_sums[entry.category] += amount
-            rows.append({
-                'Date': entry.date,
-                'Description': entry.description,
-                'Credit': '',
-                'Debit': amount,
-                'Category': entry.category
-            })
-        import pandas as pd
-        df = pd.DataFrame(rows, columns=['Date', 'Description', 'Credit', 'Debit', 'Category'])
-        transactions_dfs['CASH'] = df
+            # Cash entries: negative amount means debit (outflow). We'll store amount as provided.
+            tx = Transaction.create(
+                date=entry.date,
+                description=entry.description,
+                amount=amount,
+                bank='CASH',
+                category=entry.category,
+                merchant=None,
+            )
+            # Force category assignment consistent with summary accumulation
+            tx.category = entry.category
+            txs.append(tx)
+        if txs:
+            transactions_by_bank['CASH'] = txs
 
     def _select_strategy(self, mode: CategorizationMode) -> CategorizationStrategy:
         if mode == CategorizationMode.PROMPT_USER:
@@ -159,7 +162,7 @@ class FinanceAnalyzer:
         """Process transactions and delegate pending resolution to chosen strategy."""
         print(f"\n💳 Processing bank statements...")
         category_sums = {category: 0 for category in CATEGORIES}
-        transactions_dfs = {}
+        transactions_by_bank: Dict[str, List[Transaction]] = {}
 
         # Ensure CAT_MAPPING lower-case canonicalization present
         for item in CATEGORIES:
@@ -185,20 +188,11 @@ class FinanceAnalyzer:
                     decisions = await strategy_impl.categorize(pending)  # type: ignore[arg-type]
                     self._apply_categorization_decisions(pending, decisions)
 
-                # 4. Accumulate category sums & build DataFrame for writer
-                rows = []
+                # 4. Accumulate category sums & store transactions
                 for tx in transactions:
                     if tx.category and tx.amount is not None:
                         category_sums[tx.category] += tx.amount
-                    rows.append({
-                        'Date': tx.date,
-                        'Description': tx.description,
-                        'Credit': tx.credit if tx.credit is not None else '',
-                        'Debit': tx.debit if tx.debit is not None else '',
-                        'Category': tx.category or ''
-                    })
-                df = pd.DataFrame(rows, columns=['Date', 'Description', 'Credit', 'Debit', 'Category'])
-                transactions_dfs[bank_name] = df
+                transactions_by_bank[bank_name] = transactions
                 print(f"✅ Processed {len(transactions)} transactions from {bank_name} (Pending resolved: {len(pending)})")
             except FileNotFoundError as e:
                 print(f"⚠️  Skipping {bank_name}: {e}")
@@ -206,10 +200,10 @@ class FinanceAnalyzer:
             except Exception as e:
                 print(f"❌ Error processing {bank_name}: {e}")
                 continue
-        return category_sums, transactions_dfs
+        return category_sums, transactions_by_bank
     
-    def _update_summary(self, year: str, month: int, category_sums: Dict[str, int]) -> pd.DataFrame:
-        """Thin wrapper delegating to SummaryService (backward compatibility)."""
+    def _update_summary(self, year: str, month: int, category_sums: Dict[str, int]):
+        """Thin wrapper delegating to SummaryService returning domain SummaryData."""
         return self.summary_service.update_summary(year, month, category_sums)
     
     def _upload_results(self) -> None:
@@ -305,28 +299,26 @@ class FinanceAnalyzer:
 
             self._download_finance_file()
             self.transaction_processor.manage_merchant_category_file(self.config.bank_folder_id)
-            category_sums, transactions_dfs = await self._process_bank_transactions(year, month, mode)
+            category_sums, transactions_by_bank = await self._process_bank_transactions(year, month, mode)
 
             cash_entries = await self.interaction_port.request_cash_entries(month, int(year), CATEGORIES)
-            self._integrate_cash_entries(cash_entries, category_sums, transactions_dfs)
+            self._integrate_cash_entries(cash_entries, category_sums, transactions_by_bank)
 
             if self.transaction_processor.merchant_store.dirty:
                 self.transaction_processor.save_merchant_category_file(self.config.bank_folder_id)
 
-            summary_df = self._update_summary(year, month, category_sums)
+            summary_data = self._update_summary(year, month, category_sums)
 
-            lines = [SummaryCategoryLine(category=k, total=v) for k, v in category_sums.items()]
-            total_income = sum(v for k, v in category_sums.items() if v > 0)
-            total_expense = sum(-v for k, v in category_sums.items() if v < 0)
-            net = total_income - total_expense
-            summary_view = SummaryView(month=month, year=int(year), categories=lines, total_income=total_income, total_expense=total_expense, net=net)
+            # Build and show summary view (presentation concern separated)
+            summary_view = build_summary_view(month, int(year), category_sums)
             await self.interaction_port.show_summary(summary_view)
 
             print(f"💾 Saving results to Excel...")
-            self.writer.write(year, month, transactions_dfs, summary_df, LOCAL_OUTPUT_FILE)
-            # self._upload_results()
+            # Writer still expects DataFrame until refactor; pass domain object for future change
+            self.writer.write(year, month, transactions_by_bank, summary_data, LOCAL_OUTPUT_FILE)
+            self._upload_results()
             print(f"\n✅ Processing complete! Summary for {calendar.month_name[month]} {year} has been updated.")
-            print(f"📊 Processed {sum(len(df) for df in transactions_dfs.values())} total transactions")
+            print(f"📊 Processed {sum(len(v) for v in transactions_by_bank.values())} total transactions")
         except Exception as e:
             print(f"\n❌ Error: {str(e)}")
             raise

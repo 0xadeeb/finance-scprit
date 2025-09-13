@@ -1,15 +1,19 @@
-"""
-Excel file writing and formatting functionality.
+"""Excel file writing and formatting functionality (infrastructure layer).
+
+Public interface uses domain objects; internal helper converts to pandas
+DataFrames for convenience.
 """
 
-import pandas as pd
+import pandas as pd  # Internal use only
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Side, Border
 from openpyxl.utils import get_column_letter
-from typing import Dict
+from typing import Dict, List
 
 from .base import Writer
 from ..constants import CREDIT_CATEGORIES, DEBIT_CATEGORIES
+from ..models import Transaction
+from ..services.summary.models import SummaryData, SummaryRow
 
 
 class ExcelWriter(Writer):
@@ -36,9 +40,9 @@ class ExcelWriter(Writer):
             bottom=Side(style='dotted')
         )
     
-    def append_to_sheet(self, month: int, workbook: openpyxl.Workbook, sheet_name: str, 
-                       dataframe: pd.DataFrame) -> tuple:
-        """Append data to a worksheet with formatting"""
+    def append_to_sheet(self, month: int, workbook: openpyxl.Workbook, sheet_name: str,
+                        dataframe: pd.DataFrame) -> tuple:
+        """Append a pandas DataFrame to a worksheet with month coloring."""
         # If the sheet does not exist, create it
         if sheet_name not in workbook.sheetnames:
             workbook.create_sheet(sheet_name)
@@ -67,9 +71,9 @@ class ExcelWriter(Writer):
         """Check if this writer supports advanced formatting"""
         return True
     
-    def format_summary_worksheet(self, worksheet: openpyxl.worksheet.worksheet.Worksheet, 
-                                summary_df: pd.DataFrame) -> None:
-        """Apply formatting to the summary worksheet"""
+    def format_summary_worksheet(self, worksheet: openpyxl.worksheet.worksheet.Worksheet,
+                                 summary_df: pd.DataFrame) -> None:
+        """Apply formatting to the summary worksheet (expects pandas DataFrame)."""
         credit_start_row = 4
         debit_start_row = credit_start_row + len(CREDIT_CATEGORIES) + 1
         net_start_row = debit_start_row + len(DEBIT_CATEGORIES) + 1
@@ -94,8 +98,8 @@ class ExcelWriter(Writer):
             worksheet.column_dimensions[get_column_letter(i + 2)].width = column_len
     
     def format_transactions_worksheet(self, worksheet: openpyxl.worksheet.worksheet.Worksheet,
-                                    transactions_df: pd.DataFrame, start_row: int) -> None:
-        """Apply formatting to transactions worksheet"""
+                                      transactions_df: pd.DataFrame, start_row: int) -> None:
+        """Apply formatting to transactions worksheet (expects pandas DataFrame)."""
         # Apply font colors based on credit/debit
         for i in range(len(transactions_df)):
             if pd.notna(transactions_df.iloc[i]['Credit']):
@@ -109,19 +113,24 @@ class ExcelWriter(Writer):
             column_len = max(column_len, len(col)) + 2
             worksheet.column_dimensions[get_column_letter(i + 1)].width = column_len
     
-    def write(self, year: str, month: int, transactions_dfs: Dict[str, pd.DataFrame], 
-             summary_df: pd.DataFrame, output_path: str) -> bool:
-        """Write all data to Excel file with formatting"""
+    def write(self, year: str, month: int, transactions_by_bank: Dict[str, List[Transaction]],
+              summary: SummaryData, output_path: str) -> bool:
+        """Convert domain objects to DataFrames and persist to Excel."""
         try:
+            transactions_dfs = {
+                bank: self._transactions_to_df(txs)
+                for bank, txs in transactions_by_bank.items()
+            }
+            summary_df = self._summary_to_df(summary)
             self.write_to_excel(year, month, transactions_dfs, summary_df, output_path)
             return True
         except Exception as e:
             print(f"❌ Error writing Excel file: {str(e)}")
             return False
     
-    def write_to_excel(self, year: str, month: int, transactions_dfs: Dict[str, pd.DataFrame], 
-                      summary_df: pd.DataFrame, output_path: str) -> None:
-        """Write all data to Excel file with formatting"""
+    def write_to_excel(self, year: str, month: int, transactions_dfs: Dict[str, pd.DataFrame],
+                       summary_df: pd.DataFrame, output_path: str) -> None:
+        """Low-level writer that assumes pandas DataFrames already prepared."""
         
         # Write summary data first
         with pd.ExcelWriter(output_path, engine='openpyxl', mode='a', if_sheet_exists='replace') as writer:
@@ -144,3 +153,32 @@ class ExcelWriter(Writer):
         finally:
             # Ensure workbook is properly closed
             workbook.close()
+
+    # ------------------------------------------------------------------
+    # Internal conversion helpers
+    # ------------------------------------------------------------------
+    def _transactions_to_df(self, transactions: List[Transaction]) -> pd.DataFrame:
+        rows = []
+        for tx in transactions:
+            rows.append({
+                'Date': tx.date,
+                'Description': tx.description,
+                'Credit': tx.credit if tx.credit is not None else '',
+                'Debit': tx.debit if tx.debit is not None else '',
+                'Category': tx.category or ''
+            })
+        return pd.DataFrame(rows, columns=['Date', 'Description', 'Credit', 'Debit', 'Category'])
+
+    def _summary_to_df(self, summary: SummaryData) -> pd.DataFrame:
+        # Determine dynamic month columns from first row or calendar
+        # Summary rows already have month_values keyed by month names
+        import calendar
+        month_names = [calendar.month_name[i] for i in range(1, 13)]
+        data = {}
+        for row in summary.rows:
+            row_dict = {m: row.month_values.get(m, 0.0) for m in month_names}
+            row_dict['Avg'] = row.avg
+            row_dict['Total'] = row.total
+            data[row.name] = row_dict
+        df = pd.DataFrame.from_dict(data, orient='index')
+        return df
